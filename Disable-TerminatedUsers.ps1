@@ -3,8 +3,9 @@
     Automated account lifecycle management system
 .DESCRIPTION
     Script for intelligent deactivation and auditing of terminated employee accounts
+    with risk assessment
 .NOTES
-    Version: 0.1
+    Version: 0.5
     Author: Security Automation Team
     Requires: Module ActiveDirectory
 #>
@@ -13,11 +14,19 @@
 $Config = @{
     DomainController = "DC01.corp.domain.com"
     TerminationOU = "OU=Уволенные,OU=Пользователи,DC=corp,DC=domain,DC=com"
+    RetentionPeriod = 90
+    DatabasePath = "C:\ProgramData\IdentityManager\accounts.db"
     LogDirectory = "C:\Audit\IdentityLifecycle"
 }
 #endregion
 
 #region Initialization
+class AccountLifecycle {
+    [string]$SamAccountName
+    [datetime]$DeactivationDate
+    [string]$Status
+}
+
 function Initialize-Environment {
     param($Config)
     
@@ -28,19 +37,53 @@ function Initialize-Environment {
     Import-Module ActiveDirectory -Force
     
     # Create directory structure
-    if (-not (Test-Path $Config.LogDirectory)) {
-        New-Item -Path $Config.LogDirectory -ItemType Directory -Force | Out-Null
+    $directories = @($Config.LogDirectory, (Split-Path $Config.DatabasePath))
+    foreach ($dir in $directories) {
+        if (-not (Test-Path $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        }
     }
 }
 #endregion
 
-#region Basic logging
-function Write-Log {
-    param($Message)
+#region Risk assessment
+function Get-AccountRiskAssessment {
+    param($User)
+    
+    $riskScore = 0
+    $indicators = @()
+    
+    # Check last logon
+    if ($User.LastLogonDate -gt (Get-Date).AddDays(-7)) {
+        $riskScore += 30
+        $indicators += "Recent login activity"
+    }
+    
+    # Check privileged groups
+    $privilegedGroups = @("Domain Admins", "Enterprise Admins", "Schema Admins")
+    $userGroups = Get-ADPrincipalGroupMembership $User | Select-Object -ExpandProperty Name
+    if ($userGroups | Where-Object { $_ -in $privilegedGroups }) {
+        $riskScore += 50
+        $indicators += "Privileged group member"
+    }
+    
+    return @{
+        RiskScore = $riskScore
+        Indicators = $indicators
+        RiskLevel = if ($riskScore -ge 70) { "High" } elseif ($riskScore -ge 30) { "Medium" } else { "Low" }
+    }
+}
+#endregion
+
+#region Enhanced logging
+function Write-AuditLog {
+    param($EventType, $Message, $Severity = "Info")
     
     $logEntry = @{
         Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        EventType = $EventType
         Message = $Message
+        Severity = $Severity
         Hostname = $env:COMPUTERNAME
     }
     
@@ -50,32 +93,39 @@ function Write-Log {
 #endregion
 
 #region Main process
-function Start-AccountDeactivation {
+function Start-AccountLifecycleManagement {
     param($Config)
     
     Initialize-Environment -Config $Config
-    Write-Log -Message "Starting account deactivation process"
+    Write-AuditLog -EventType "ProcessStart" -Message "Starting account lifecycle management"
     
     try {
-        # Find accounts to process
-        $users = Get-ADUser -Filter * -SearchBase $Config.TerminationOU -Properties Enabled
+        $users = Get-ADUser -Filter * -SearchBase $Config.TerminationOU -Properties *
         
         foreach ($user in $users) {
             if ($user.Enabled) {
-                Write-Log -Message "Processing account: $($user.SamAccountName)"
+                Write-AuditLog -EventType "Processing" -Message "Processing account: $($user.SamAccountName)"
+                
+                # Risk assessment
+                $riskAssessment = Get-AccountRiskAssessment -User $user
+                if ($riskAssessment.RiskLevel -eq "High") {
+                    Write-AuditLog -EventType "HighRisk" -Message "High risk account detected: $($user.SamAccountName)" -Severity "Warning"
+                }
+                
+                # Deactivate account
                 Disable-ADAccount -Identity $User -Confirm:$false
-                Set-ADUser -Identity $User -Description "Deactivated: $(Get-Date -Format 'yyyy-MM-dd')"
-                Write-Log -Message "Account $($user.SamAccountName) disabled"
+                Set-ADUser -Identity $User -Description "Deactivated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                
+                Write-AuditLog -EventType "Deactivation" -Message "Account $($user.SamAccountName) disabled"
             }
         }
         
     } catch {
-        Write-Log -Message "Error: $($_.Exception.Message)"
+        Write-AuditLog -EventType "Error" -Message "Process error: $($_.Exception.Message)" -Severity "Error"
     } finally {
-        Write-Log -Message "Process completed"
+        Write-AuditLog -EventType "ProcessEnd" -Message "Process completed"
     }
 }
 
-# Start process
-Start-AccountDeactivation -Config $Config
+Start-AccountLifecycleManagement -Config $Config
 #endregion
