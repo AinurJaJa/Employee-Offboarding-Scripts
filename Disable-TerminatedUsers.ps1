@@ -13,12 +13,12 @@
 #region Конфигурация
 $Config = @{
     DomainController = ""
-    TerminationOU = "OU=Уволенные,OU=Пользователи,DC=corp,DC=detaildelivery, DC=ru"
+    TerminationOU = "OU=Уволенные,OU=Пользователи,DC=corp,DC=domain, DC=com"
     RetentionPeriod = 90
     SIEMEndpoint = ""
     DatabasePath = "C:\ProgramData\IdentityManager\accounts.db"
     LogDirectory = "C:\Audit\IdentityLifecycle"
-    NotificationEmail = "security-team@detaildelivery.ru"
+    NotificationEmail = "security-team@domain.com"
     LogRetentionDays = 30
 }
 #endregion
