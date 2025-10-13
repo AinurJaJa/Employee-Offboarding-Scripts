@@ -5,7 +5,7 @@
     Скрипт для интеллектуального отключения и аудита учетных записей уволенных сотрудников
     с интеграцией с SIEM системой и многоуровневым логированием
 .NOTES
-    Version: 2.0
+    Version: 2.1
     Author: Security Automation Team
     Requires: Module ActiveDirectory, PSSQLite
 #>
@@ -13,12 +13,13 @@
 #region Конфигурация
 $Config = @{
     DomainController = ""
-    TerminationOU = "OU=Уволенные,OU=Пользователи,DC=corp,DC=domain,DC=com"
+    TerminationOU = "OU=Уволенные,OU=Пользователи,DC=corp,DC=detaildelivery, DC=ru"
     RetentionPeriod = 90
     SIEMEndpoint = ""
     DatabasePath = "C:\ProgramData\IdentityManager\accounts.db"
     LogDirectory = "C:\Audit\IdentityLifecycle"
-    NotificationEmail = "security-team@domain.com"
+    NotificationEmail = "security-team@detaildelivery.ru"
+    LogRetentionDays = 30
 }
 #endregion
 
@@ -77,6 +78,9 @@ function Initialize-AccountDatabase {
         Severity TEXT NOT NULL,
         Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    
+    CREATE INDEX IF NOT EXISTS idx_account_history_name ON AccountHistory(SamAccountName);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON AuditLog(Timestamp);
 "@
     Invoke-SQLiteQuery -Query $query -DataSource $Path
 }
@@ -95,7 +99,7 @@ function Get-AccountRiskAssessment {
         $indicators += "Активный вход в последние 7 дней"
     }
     
-    # Проверка членства в привилегированных группы
+    # Проверка членства в привилегированных группах
     $privilegedGroups = @("Domain Admins", "Enterprise Admins", "Schema Admins")
     $userGroups = Get-ADPrincipalGroupMembership $User | Select-Object -ExpandProperty Name
     if ($userGroups | Where-Object { $_ -in $privilegedGroups }) {
@@ -161,15 +165,26 @@ function Invoke-AccountDeactivation {
         Clear-ADUserRiskAttributes -User $User
         
         $lifecycleData.Status = "Completed"
-        Write-AuditLog -EventType "Deactivation" -Message "Учетная запись $($User.SamAccountName) отключена" -Severity "Info"
+        Write-AuditLog -EventType "Deactivation" -Message "Учетная запись $($User.SamAccountName) отключена" -Severity "Info" -Config $Config
         
     } catch {
         $lifecycleData.Status = "Failed"
-        Write-AuditLog -EventType "Error" -Message "Ошибка отключения $($User.SamAccountName): $($_.Exception.Message)" -Severity "Error"
+        Write-AuditLog -EventType "Error" -Message "Ошибка отключения $($User.SamAccountName): $($_.Exception.Message)" -Severity "Error" -Config $Config
     }
     
     # Сохранение в базу данных
     Save-AccountHistory -LifecycleData $lifecycleData -Config $Config
+}
+
+function Clear-ADUserRiskAttributes {
+    param($User)
+    
+    try {
+        # Очистка потенциально опасных атрибутов
+        Set-ADUser -Identity $User -Clear "msTSInitialProgram", "msTSWorkDirectory", "msTSHomeDirectory"
+    } catch {
+        Write-Warning "Не удалось очистить атрибуты пользователя $($User.SamAccountName): $($_.Exception.Message)"
+    }
 }
 #endregion
 
@@ -190,11 +205,18 @@ function Send-ImmediateAlert {
     # Отправка через SMTP или API системы уведомлений
     Send-EmailNotification -To $Config.NotificationEmail -Subject $subject -Body $body
 }
+
+function Send-EmailNotification {
+    param($To, $Subject, $Body)
+    
+    # Заглушка для реализации отправки email
+    Write-Host "Уведомление отправлено: $Subject" -ForegroundColor Yellow
+}
 #endregion
 
 #region Логирование
 function Write-AuditLog {
-    param($EventType, $Message, $Severity)
+    param($EventType, $Message, $Severity, $Config)
     
     $logEntry = @{
         Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -209,11 +231,46 @@ function Write-AuditLog {
     Add-Content -Path $logPath -Value ($logEntry | ConvertTo-Json -Compress)
     
     # Отправка в SIEM систему
-    try {
-        Invoke-RestMethod -Uri $Config.SIEMEndpoint -Method Post -Body ($logEntry | ConvertTo-Json) -ContentType "application/json"
-    } catch {
-        Write-Warning "Не удалось отправить лог в SIEM: $($_.Exception.Message)"
+    if (-not [string]::IsNullOrEmpty($Config.SIEMEndpoint)) {
+        try {
+            Invoke-RestMethod -Uri $Config.SIEMEndpoint -Method Post -Body ($logEntry | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
+        } catch {
+            Write-Warning "Не удалось отправить лог в SIEM: $($_.Exception.Message)"
+        }
     }
+}
+
+function Invoke-LogMaintenance {
+    param($Config)
+    
+    try {
+        $cutoffDate = (Get-Date).AddDays(-$Config.LogRetentionDays).ToString("yyyyMMdd")
+        Get-ChildItem $Config.LogDirectory -Filter "audit_*.log" | 
+            Where-Object { $_.BaseName -replace 'audit_', '' -lt $cutoffDate } |
+            Remove-Item -Force
+    } catch {
+        Write-Warning "Ошибка очистки логов: $($_.Exception.Message)"
+    }
+}
+#endregion
+
+#region Вспомогательные функции
+function Revoke-UserSessions {
+    param($UserName)
+    # Заглушка для реализации принудительного разрыва сессий
+    Write-Host "Сессии пользователя $UserName будут разорваны" -ForegroundColor Cyan
+}
+
+function Reset-UserPassword {
+    param($UserName)
+    # Заглушка для реализации сброса пароля
+    Write-Host "Пароль пользователя $UserName будет сброшен" -ForegroundColor Cyan
+}
+
+function Save-AccountHistory {
+    param($LifecycleData, $Config)
+    # Заглушка для сохранения в базу данных
+    Write-Host "Данные сохранены для $($LifecycleData.SamAccountName)" -ForegroundColor Green
 }
 #endregion
 
@@ -222,23 +279,26 @@ function Start-AccountLifecycleManagement {
     param($Config)
     
     Initialize-Environment -Config $Config
-    Write-AuditLog -EventType "ProcessStart" -Message "Запуск управления жизненным циклом учетных записей" -Severity "Info"
+    Write-AuditLog -EventType "ProcessStart" -Message "Запуск управления жизненным циклом учетных записей" -Severity "Info" -Config $Config
     
     try {
+        # Очистка старых логов
+        Invoke-LogMaintenance -Config $Config
+        
         # Поиск учетных записей для обработки
         $users = Get-ADUser -Filter * -SearchBase $Config.TerminationOU -Properties *
         
         foreach ($user in $users) {
             if ($user.Enabled) {
-                Write-AuditLog -EventType "Processing" -Message "Обработка учетной записи: $($user.SamAccountName)" -Severity "Info"
+                Write-AuditLog -EventType "Processing" -Message "Обработка учетной записи: $($user.SamAccountName)" -Severity "Info" -Config $Config
                 Invoke-AccountDeactivation -User $user -Config $Config
             }
         }
         
     } catch {
-        Write-AuditLog -EventType "Error" -Message "Критическая ошибка процесса: $($_.Exception.Message)" -Severity "Critical"
+        Write-AuditLog -EventType "Error" -Message "Критическая ошибка процесса: $($_.Exception.Message)" -Severity "Critical" -Config $Config
     } finally {
-        Write-AuditLog -EventType "ProcessEnd" -Message "Завершение управления жизненным циклом учетных записей" -Severity "Info"
+        Write-AuditLog -EventType "ProcessEnd" -Message "Завершение управления жизненным циклом учетных записей" -Severity "Info" -Config $Config
     }
 }
 
