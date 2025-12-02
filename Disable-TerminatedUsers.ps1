@@ -20,8 +20,31 @@ $Config = @{
     LogDirectory = "C:\Audit\IdentityLifecycle"
     NotificationEmail = "security-team@domain.com"
     LogRetentionDays = 30
+    CriticalAccessGroups = @(
+        "Finance_System_Admins",
+        "SQL_DB_Owners", 
+        "ERP_Superusers",
+        "VPN_Privileged_Access",
+        "SharePoint_Administrators"
+    )
 }
 #endregion
+
+
+function Get-CriticalAccessGroups {
+    param($UserName)
+    
+    $criticalGroups = @()
+    $allGroups = Get-ADPrincipalGroupMembership -Identity $UserName | Select-Object -ExpandProperty Name
+    
+    foreach ($group in $Config.CriticalAccessGroups) {
+        if ($allGroups -contains $group) {
+            $criticalGroups += $group
+        }
+    }
+    
+    return $criticalGroups
+}
 
 #region Инициализация
 class AccountLifecycle {
@@ -106,7 +129,15 @@ function Get-AccountRiskAssessment {
         $riskScore += 50
         $indicators += "Член привилегированной группы"
     }
-    
+
+    $criticalGroups = Get-CriticalAccessGroups -UserName $User.SamAccountName
+    if ($criticalGroups.Count -gt 0) {
+        $riskScore += 40
+        $indicators += "Член критичных групп доступа: $($criticalGroups -join ', ')"
+        # Сохраняем информацию о критичных группах для детального отчета
+        $User | Add-Member -NotePropertyName CriticalAccessGroups -NotePropertyValue $criticalGroups -Force
+    }
+
     # Проверка активных сессий (псевдо-код, реализация зависит от среды)
     $activeSessions = Test-ActiveUserSessions -UserName $User.SamAccountName
     if ($activeSessions) {
@@ -129,6 +160,28 @@ function Test-ActiveUserSessions {
 }
 #endregion
 
+function Send-CriticalAccessNotification {
+    param($User, $CriticalGroups, $Config)
+    
+    $subject = "⚠️ КРИТИЧНЫЙ ДОСТУП: Учетная запись $($User.SamAccountName) имеет привилегированный доступ"
+    $body = @"
+Внимание! Отключаемая учетная запись имеет доступ к критичным системам:
+Пользователь: $($User.SamAccountName)
+Отображаемое имя: $($User.Name)
+Отдел: $($User.Department)
+Критичные группы: $($CriticalGroups -join ', ')
+Время отключения: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+Требуется дополнительная проверка:
+1. Убедиться в отсутствии зависимостей
+2. Проверить наличие резервных доступов
+3. Уведомить владельцев систем
+
+"@
+    
+    Send-EmailNotification -To $Config.NotificationEmail -Subject $subject -Body $body
+}
+
 #region Действия
 function Invoke-AccountDeactivation {
     param($User, $Config)
@@ -141,7 +194,10 @@ function Invoke-AccountDeactivation {
         HasActiveSessions = Test-ActiveUserSessions -UserName $User.SamAccountName
         Status = "Pending"
     }
-    
+    if ($criticalGroups.Count -gt 0) {
+        Write-AuditLog -EventType "CriticalAccess" -Message "Учетная запись $($User.SamAccountName) имеет доступ к критичным системам через группы: $($criticalGroups -join ', ')" -Severity "Warning" -Config $Config
+        Send-CriticalAccessNotification -User $User -CriticalGroups $criticalGroups -Config $Config
+    }
     # Оценка рисков
     $riskAssessment = Get-AccountRiskAssessment -User $User
     
