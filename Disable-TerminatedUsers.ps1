@@ -185,7 +185,7 @@ function Send-CriticalAccessNotification {
 #region Действия
 function Invoke-AccountDeactivation {
     param($User, $Config)
-    
+
     $lifecycleData = [AccountLifecycle]@{
         SamAccountName = $User.SamAccountName
         DeactivationDate = Get-Date
@@ -194,43 +194,34 @@ function Invoke-AccountDeactivation {
         HasActiveSessions = Test-ActiveUserSessions -UserName $User.SamAccountName
         Status = "Pending"
     }
-    if ($criticalGroups.Count -gt 0) {
+    if ($criticalGroups -and $criticalGroups.Count -gt 0) {
         Write-AuditLog -EventType "CriticalAccess" -Message "Учетная запись $($User.SamAccountName) имеет доступ к критичным системам через группы: $($criticalGroups -join ', ')" -Severity "Warning" -Config $Config
         Send-CriticalAccessNotification -User $User -CriticalGroups $criticalGroups -Config $Config
     }
-    # Оценка рисков
     $riskAssessment = Get-AccountRiskAssessment -User $User
-    
     if ($riskAssessment.RiskLevel -eq "High") {
-        # Срочное уведомление для высокого риска
         Send-ImmediateAlert -User $User -RiskAssessment $riskAssessment -Config $Config
     }
-    
+
     try {
-        # Дополнительные меры безопасности для привилегированных учетных записей
         if ($riskAssessment.RiskScore -gt 0) {
             Revoke-UserSessions -UserName $User.SamAccountName
             Reset-UserPassword -UserName $User.SamAccountName
         }
-        
-        # Отключение учетной записи
         Disable-ADAccount -Identity $User -Confirm:$false
         Set-ADUser -Identity $User -Description "Deactivated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        
-        # Сброс атрибутов
         Clear-ADUserRiskAttributes -User $User
-        
+
         $lifecycleData.Status = "Completed"
         Write-AuditLog -EventType "Deactivation" -Message "Учетная запись $($User.SamAccountName) отключена" -Severity "Info" -Config $Config
-        
+
     } catch {
         $lifecycleData.Status = "Failed"
-        Write-AuditLog -EventType "Error" -Message "Ошибка отключения $($User.SamAccountName): $($_.Exception.Message)" -Severity "Error" -Config $Config
+        Write-AuditLog -EventType "Error" -Message ("Ошибка отключения $($User.SamAccountName): $($_.Exception.Message)`nStackTrace: $($_.ScriptStackTrace)") -Severity "Error" -Config $Config
     }
-    
-    # Сохранение в базу данных
     Save-AccountHistory -LifecycleData $lifecycleData -Config $Config
 }
+
 
 function Clear-ADUserRiskAttributes {
     param($User)
