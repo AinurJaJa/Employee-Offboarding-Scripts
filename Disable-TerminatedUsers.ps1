@@ -265,24 +265,47 @@ function Send-EmailNotification {
 function Write-AuditLog {
     param($EventType, $Message, $Severity, $Config)
     
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = @{
-        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Timestamp = $timestamp
         EventType = $EventType
         Message = $Message
         Severity = $Severity
         Hostname = $env:COMPUTERNAME
+        ProcessId = $pid
     }
-    
-    # Локальное логирование
     $logPath = Join-Path $Config.LogDirectory "audit_$(Get-Date -Format 'yyyyMMdd').log"
-    Add-Content -Path $logPath -Value ($logEntry | ConvertTo-Json -Compress)
+    $logLine = "$timestamp [$Severity] [$EventType] $Message (Host: $env:COMPUTERNAME, PID: $pid)"
     
-    # Отправка в SIEM систему
+    try {
+        Add-Content -Path $logPath -Value $logLine -Encoding UTF8
+        if ((Get-Item $logPath -ErrorAction SilentlyContinue).Length -gt 50MB) {
+            $archivePath = $logPath -replace '\.log$', "_$(Get-Date -Format 'HHmmss').log"
+            Move-Item $logPath $archivePath -Force
+            Compress-Archive -Path $archivePath -DestinationPath "$archivePath.zip" -Force
+            Remove-Item $archivePath -Force
+        }
+    } catch {
+        Write-Warning "Не удалось записать локальный лог: $($_.Exception.Message)"
+    }
     if (-not [string]::IsNullOrEmpty($Config.SIEMEndpoint)) {
-        try {
-            Invoke-RestMethod -Uri $Config.SIEMEndpoint -Method Post -Body ($logEntry | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
-        } catch {
-            Write-Warning "Не удалось отправить лог в SIEM: $($_.Exception.Message)"
+        $maxRetries = 3
+        $retryDelay = 1
+        
+        for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+                Invoke-RestMethod -Uri $Config.SIEMEndpoint -Method Post -Body ($logEntry | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
+                break
+            } catch {
+                if ($i -eq $maxRetries) {
+                    Write-Warning "Не удалось отправить лог в SIEM после $maxRetries попыток: $($_.Exception.Message)"
+                    $failedLogPath = Join-Path $Config.LogDirectory "failed_siem_logs.json"
+                    $logEntry | ConvertTo-Json | Out-File -FilePath $failedLogPath -Append
+                } else {
+                    Start-Sleep -Seconds $retryDelay
+                    $retryDelay *= 2
+                }
+            }
         }
     }
 }
@@ -291,10 +314,16 @@ function Invoke-LogMaintenance {
     param($Config)
     
     try {
-        $cutoffDate = (Get-Date).AddDays(-$Config.LogRetentionDays).ToString("yyyyMMdd")
+        $cutoffDate = (Get-Date).AddDays(-$Config.LogRetentionDays)
+        
         Get-ChildItem $Config.LogDirectory -Filter "audit_*.log" | 
-            Where-Object { $_.BaseName -replace 'audit_', '' -lt $cutoffDate } |
-            Remove-Item -Force
+            Where-Object { $_.LastWriteTime -lt $cutoffDate } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $Config.LogDirectory -Filter "*.zip" |
+            Where-Object { $_.LastWriteTime -lt $cutoffDate } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+            
+        Write-Host "Очистка логов завершена. Удалено файлов старше $($Config.LogRetentionDays) дней" -ForegroundColor Green
     } catch {
         Write-Warning "Ошибка очистки логов: $($_.Exception.Message)"
     }
